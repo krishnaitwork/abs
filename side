@@ -1,0 +1,891 @@
+import * as vscode from 'vscode';
+import { KPAgentMode } from '../modes/AgentMode';
+import { KPChatMode } from '../modes/ChatMode';
+import { ProviderManager } from '../providers/ProviderManager';
+
+export class KPSidebarProvider implements vscode.WebviewViewProvider {
+  public static readonly viewType = 'kp-ai-chat';
+  private readonly providerManager: ProviderManager;
+  private readonly chatMode: KPChatMode;
+  private readonly agentMode: KPAgentMode;
+  private _view?: vscode.WebviewView;
+  private currentMode: string = 'ask';
+  private conversationStarted: boolean = false;
+
+  constructor(
+    private readonly _extensionUri: vscode.Uri, 
+    providerManager?: ProviderManager
+  ) {
+    this.providerManager = providerManager || ProviderManager.getInstance();
+    this.chatMode = new KPChatMode(this.providerManager);
+    this.agentMode = new KPAgentMode(this.providerManager);
+  }
+
+  public resolveWebviewView(
+    webviewView: vscode.WebviewView,
+    context: vscode.WebviewViewResolveContext,
+    _token: vscode.CancellationToken,
+  ) {
+    this._view = webviewView;
+    
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this._extensionUri]
+    };
+
+    webviewView.webview.html = this._getHtmlForWebview();
+
+    webviewView.webview.onDidReceiveMessage(async (data) => {
+      console.log('📨 Received message:', data);
+      
+      if (data.type === 'send') {
+        console.log('🔧 Processing send message with mode:', data.mode, 'message:', data.message);
+        await this._handleChat(data.mode || 'ask', data.message, data.editOptions);
+      } else if (data.type === 'ready') {
+        console.log('🚀 Webview ready, sending initial data');
+        this._sendInitialData(webviewView);
+      } else if (data.type === 'clearHistory') {
+        console.log('🗑️ Clearing conversation history');
+        await this._clearConversation();
+      } else if (data.type === 'openSettings') {
+        // Open the existing KP AI Assistant Settings panel
+        vscode.commands.executeCommand('kpAiAssistant.openSettings');
+      }
+    });
+  }
+
+  private async _handleChat(mode: string, message: string, editOptions?: any): Promise<void> {
+    console.log('🔧 _handleChat called with mode:', mode, 'message:', message);
+    
+    try {
+      let response = '';
+      
+      // Start new conversation only if mode changed or it's the first time
+      if (mode !== this.currentMode || !this.conversationStarted) {
+        console.log(`� Mode changed from ${this.currentMode} to ${mode}, starting new conversation`);
+        await this.chatMode.startNewConversation();
+        this.currentMode = mode;
+        this.conversationStarted = true;
+      }
+      
+      switch (mode) {
+        case 'ask':
+          console.log('💬 Continuing Ask mode conversation');
+          const askResult = await this.chatMode.sendMessage(message, 'user');
+          response = askResult.content;
+          break;
+          
+        case 'edit':
+          console.log('✏️ Processing Edit mode with options:', editOptions);
+          const editor = vscode.window.activeTextEditor;
+          if (!editor) {
+            response = '⚠️ Please open a file in the editor first to use Edit mode.';
+          } else {
+            const document = editor.document;
+            const selection = editor.selection;
+            const selectedText = document.getText(selection);
+            const fullText = document.getText();
+            
+            // Determine what to edit based on options
+            const useSelection = editOptions?.selectionOnly && selectedText.length > 0;
+            const targetText = useSelection ? selectedText : fullText;
+            const context = useSelection ? 'selected code' : `file (${document.fileName})`;
+            
+            // Don't start new conversation for edit mode - continue the conversation
+            const editPrompt = `Edit the ${context}:\n\`\`\`\n${targetText}\n\`\`\`\n\nRequest: ${message}\n\nPlease provide ONLY the modified code in a code block, without explanations.`;
+            
+            const editResult = await this.chatMode.sendMessage(editPrompt, 'user');
+            response = editResult.content;
+            
+            // Extract code from response
+            const codeMatch = response.match(/\`\`\`[\s\S]*?\n([\s\S]*?)\n\`\`\`/);
+            if (codeMatch && codeMatch[1] && editOptions?.autoApply !== false) {
+              const newCode = codeMatch[1].trim();
+              
+              if (editOptions?.showDiff) {
+                // Show diff confirmation
+                const choice = await vscode.window.showInformationMessage(
+                  'Apply the code changes?',
+                  { modal: true },
+                  'Apply',
+                  'Cancel'
+                );
+                
+                if (choice !== 'Apply') {
+                  response += '\n\n🚫 Changes were not applied.';
+                  break;
+                }
+              }
+              
+              const edit = new vscode.WorkspaceEdit();
+              
+              if (useSelection) {
+                edit.replace(document.uri, selection, newCode);
+              } else {
+                const fullRange = new vscode.Range(
+                  document.positionAt(0),
+                  document.positionAt(fullText.length)
+                );
+                edit.replace(document.uri, fullRange, newCode);
+              }
+              
+              const applied = await vscode.workspace.applyEdit(edit);
+              if (applied) {
+                response += `\n\n✅ Code has been applied to your ${useSelection ? 'selection' : 'file'}.`;
+              } else {
+                response += '\n\n❌ Could not apply code automatically. You can copy the code manually.';
+              }
+            } else if (editOptions?.autoApply === false) {
+              response += '\n\n📋 Auto-apply is disabled. Copy the code manually if you want to use it.';
+            }
+          }
+          break;
+          
+        case 'agent':
+          console.log('🤖 Starting Agent mode task');
+          const agentResult = await this.agentMode.startTask(message);
+          response = `🤖 Agent task started: ${agentResult.description}\n\nI'll work on this task for you. You may see approval requests as I proceed.`;
+          break;
+          
+        default:
+          response = 'Unknown mode. Please try again.';
+      }
+      
+      console.log('📤 Sending response:', response);
+      this._view?.webview.postMessage({
+        type: 'response',
+        content: response
+      });
+      
+      console.log('✅ Response sent successfully');
+    } catch (error) {
+      console.error('❌ Error in _handleChat:', error);
+      this._view?.webview.postMessage({
+        type: 'response',
+        content: `Error: ${error instanceof Error ? error.message : String(error)}`
+      });
+    }
+  }
+
+  private _getHtmlForWebview(): string {
+    return String.raw`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>KP AI</title>
+  <style>
+    body { 
+      font-family: var(--vscode-font-family);
+      color: var(--vscode-foreground);
+      background: var(--vscode-sideBar-background);
+      margin: 0; padding: 8px;
+    }
+    .container { 
+      display: flex; 
+      flex-direction: column; 
+      height: calc(100vh - 16px); 
+    }
+    .header { 
+      margin-bottom: 8px; 
+    }
+    .messages {
+      flex: 1; 
+      overflow-y: auto; 
+      margin-bottom: 8px; 
+      padding: 8px;
+      border: 1px solid var(--vscode-widget-border); 
+      border-radius: 3px;
+      background: var(--vscode-input-background); 
+      font-size: 12px;
+    }
+    .message { 
+      margin-bottom: 10px; 
+      padding: 10px; 
+      border-radius: 6px; 
+      line-height: 1.28;
+    }
+    .user { 
+      background: var(--vscode-textBlockQuote-background); 
+      border-left: 3px solid var(--vscode-textBlockQuote-border); 
+    }
+    .ai { 
+      background: var(--vscode-textCodeBlock-background); 
+      border-left: 3px solid var(--vscode-focusBorder); 
+    }
+    .message strong {
+      color: var(--vscode-textLink-foreground);
+      margin-bottom: 8px;
+      display: block;
+    }
+    .message-content {
+      margin-top: 4px;
+    }
+    .message pre {
+      background: var(--vscode-textCodeBlock-background);
+      border: 1px solid var(--vscode-widget-border);
+      border-radius: 4px;
+      padding: 10px;
+      margin: 6px 0;
+      overflow-x: auto;
+      font-family: var(--vscode-editor-font-family);
+      font-size: 13px;
+      line-height: 1.24;
+    }
+    .message code {
+      background: var(--vscode-textCodeBlock-background);
+      border: 1px solid var(--vscode-widget-border);
+      border-radius: 3px;
+      padding: 2px 4px;
+      font-family: var(--vscode-editor-font-family);
+      font-size: 12px;
+    }
+    .message pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      border-radius: 0;
+    }
+    .message p {
+      margin: 3px 0;
+    }
+    .message ul, .message ol {
+      margin: 4px 0;
+      padding-left: 20px;
+    }
+    .message li {
+      margin: 1px 0;
+    }
+    .message blockquote {
+      border-left: 3px solid var(--vscode-textBlockQuote-border);
+      background: var(--vscode-textBlockQuote-background);
+      padding: 8px 12px;
+      margin: 8px 0;
+      font-style: italic;
+    }
+    .message .emoji {
+      font-size: 16px;
+      vertical-align: middle;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid var(--vscode-button-border);
+      border-radius: 3px;
+      padding: 4px 8px;
+      cursor: pointer;
+      font-size: 11px;
+      opacity: 0.7;
+    }
+    .copy-btn:hover {
+      opacity: 1;
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .code-block {
+      position: relative;
+      margin: 8px 0;
+    }
+    .code-header {
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-widget-border);
+      border-bottom: none;
+      border-radius: 4px 4px 0 0;
+      padding: 6px 12px;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .language-label {
+      font-weight: bold;
+      text-transform: uppercase;
+    }
+    .input-container { 
+      display: flex; 
+      gap: 4px; 
+    }
+    textarea {
+      flex: 1; 
+      padding: 6px; 
+      border: 1px solid var(--vscode-input-border);
+      border-radius: 3px; 
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground); 
+      font-size: 12px;
+      resize: vertical; 
+      min-height: 40px;
+    }
+    button {
+      padding: 6px 12px; 
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground); 
+      border: 1px solid var(--vscode-button-border);
+      border-radius: 3px; 
+      cursor: pointer; 
+      font-size: 12px;
+    }
+    button:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+    .mode-selector {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 8px;
+    }
+    .mode-btn {
+      flex: 1;
+      padding: 4px 8px;
+      font-size: 11px;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid var(--vscode-button-border);
+    }
+    .mode-btn.active {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .edit-options {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 8px;
+      padding: 8px;
+      border: 1px solid var(--vscode-widget-border);
+      border-radius: 3px;
+      background: var(--vscode-input-background);
+    }
+    .edit-options.active {
+      display: flex;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .checkbox-row input[type="checkbox"] {
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h3 style="margin: 0; font-size: 14px;">KP AI Assistant</h3>
+      <div class="mode-selector">
+        <button class="mode-btn" id="ask-btn">💬 Ask</button>
+        <button class="mode-btn" id="edit-btn">✏️ Edit</button>
+        <button class="mode-btn" id="agent-btn">🤖 Agent</button>
+        <button class="mode-btn" id="settings-btn">⚙️ Settings</button>
+        <button class="mode-btn" id="clear-btn" title="Clear History">🗑️</button>
+      </div>
+    </div>
+    
+    <!-- Edit Mode Options -->
+    <div class="edit-options" id="edit-options">
+      <div class="checkbox-row">
+        <input type="checkbox" id="auto-apply" checked>
+        <label for="auto-apply">Auto-apply code changes</label>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="selection-only">
+        <label for="selection-only">Edit selection only (if text selected)</label>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="show-diff">
+        <label for="show-diff">Show diff before applying</label>
+      </div>
+    </div>
+    
+    <div class="messages" id="messages">
+      <div class="message ai">
+        <strong>AI Assistant</strong>
+        <div class="message-content">
+          Hello! I am ready to help you.<br>
+          <small>Provider: <span id="provider">Loading...</span> | Model: <span id="model">Loading...</span></small>
+        </div>
+      </div>
+    </div>
+    
+    <div class="input-container">
+      <textarea id="input" placeholder="Type your message..."></textarea>
+      <button id="send-btn">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    let currentMode = 'ask';
+    let chatHistory = vscode.getState()?.chatHistory || [];
+    
+    // Restore chat history when webview loads
+    function restoreHistory() {
+      const messagesDiv = document.getElementById('messages');
+      if (chatHistory.length === 0) {
+        // Keep the default greeting message
+        messagesDiv.innerHTML = '<div class="message ai"><strong>AI Assistant</strong><div class="message-content">Hello! I am ready to help you.<br><small>Provider: <span id="provider">Loading...</span> | Model: <span id="model">Loading...</span></small></div></div>';
+      } else {
+        // Clear and restore from history
+        messagesDiv.innerHTML = '<div class="message ai"><strong>AI Assistant</strong><div class="message-content">Hello! I am ready to help you.<br><small>Provider: <span id="provider">Loading...</span> | Model: <span id="model">Loading...</span></small></div></div>';
+        chatHistory.forEach(function(msg) {
+          addMessage(msg.type, msg.content);
+        });
+        messagesDiv.lastElementChild?.scrollIntoView();
+      }
+    }
+
+    function selectMode(mode) {
+      try {
+        console.log('KP AI: Selecting mode:', mode);
+        currentMode = mode;
+        
+        // Update button states - only for ask, edit, agent (exclude settings and clear buttons)
+        document.querySelectorAll('.mode-btn:not(#settings-btn):not(#clear-btn)').forEach(btn => btn.classList.remove('active'));
+        const modeBtn = document.getElementById(mode + '-btn');
+        if (modeBtn) {
+          modeBtn.classList.add('active');
+        }
+        
+        // Show/hide panels
+        const editOptions = document.getElementById('edit-options');
+        if (editOptions) {
+          editOptions.classList.toggle('active', mode === 'edit');
+        }
+        
+        // Update placeholder
+        const input = document.getElementById('input');
+        if (input) {
+          switch(mode) {
+            case 'ask':
+              input.placeholder = 'Ask me anything...';
+              break;
+            case 'edit':
+              input.placeholder = 'Describe how to edit your code...';
+              break;
+            case 'agent':
+              input.placeholder = 'Describe the task you want me to complete...';
+              break;
+          }
+        }
+        console.log('KP AI: Mode selection complete');
+      } catch (error) {
+        console.error('KP AI: Error in selectMode:', error);
+      }
+    }
+    
+    function openSettings() {
+      // Open the existing KP AI Assistant Settings panel
+      vscode.postMessage({ type: 'openSettings' });
+    }
+    
+    function clearHistory() {
+      vscode.postMessage({ type: 'clearHistory' });
+      chatHistory = [];
+      vscode.setState({ chatHistory });
+      restoreHistory();
+    }
+    
+    function send() {
+      try {
+        console.log('KP AI: Send function called');
+        const input = document.getElementById('input');
+        if (!input) {
+          console.error('KP AI: Input element not found');
+          return;
+        }
+        
+        const message = input.value.trim();
+        if (!message) return;
+        
+        // Add user message
+        addMessage('user', message);
+        input.value = '';
+        
+        // Get edit options if in edit mode
+        let editOptions = {};
+        if (currentMode === 'edit') {
+          const autoApply = document.getElementById('auto-apply');
+          const selectionOnly = document.getElementById('selection-only');
+          const showDiff = document.getElementById('show-diff');
+          
+          editOptions = {
+            autoApply: autoApply ? autoApply.checked : true,
+            selectionOnly: selectionOnly ? selectionOnly.checked : false,
+            showDiff: showDiff ? showDiff.checked : false
+          };
+        }
+        
+        // Send to extension with current mode and options
+        vscode.postMessage({ 
+          type: 'send', 
+          message: message,
+          mode: currentMode,
+          editOptions: editOptions
+        });
+        console.log('KP AI: Message sent successfully');
+      } catch (error) {
+        console.error('KP AI: Error in send function:', error);
+      }
+    }
+    
+    function addMessage(type, content) {
+      try {
+        console.log('KP AI: Adding message:', type, content.substring(0, 50));
+        const messages = document.getElementById('messages');
+        if (!messages) {
+          console.error('KP AI: Messages element not found');
+          return;
+        }
+        
+        const div = document.createElement('div');
+        div.className = 'message ' + type;
+        
+        // Create header
+        const header = document.createElement('strong');
+        header.textContent = type === 'user' ? 'You' : 'AI Assistant';
+        div.appendChild(header);
+        
+        // Create content container
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'message-content';
+        
+        // Format content based on type and content
+        const formattedContent = formatMessageContent(content);
+        contentDiv.innerHTML = formattedContent;
+        
+        div.appendChild(contentDiv);
+        messages.appendChild(div);
+        div.scrollIntoView();
+        
+        // Add copy buttons to code blocks
+        addCopyButtons(div);
+        
+        // Save to history (only save user and AI messages, not system messages)
+        if (type === 'user' || type === 'ai') {
+          chatHistory.push({ type, content });
+          vscode.setState({ chatHistory });
+        }
+        console.log('KP AI: Message added successfully');
+      } catch (error) {
+        console.error('KP AI: Error in addMessage function:', error);
+      }
+    }
+    
+    function formatMessageContent(content) {
+      // 1) Extract code blocks first and replace with safe placeholders to protect content
+      const codeBlocks = [];
+      content = content.replace(/\`\`\`(\w+)?\n?([\s\S]*?)\`\`\`/g, function(match, language, code) {
+        const lang = language || 'text';
+        // Normalize line endings and trim edges
+        const normalized = (code || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+        const highlightedCode = highlightCode(normalized, lang);
+        const html = '<div class="code-block"><div class="code-header"><span class="language-label">' + lang + '</span></div><pre><code class="language-' + lang + '">' + highlightedCode + '</code></pre></div>';
+        // Use control-character based tokens so markdown formatting won't touch them
+        const token = '\u0001CB' + codeBlocks.length + '\u0001';
+        codeBlocks.push({ token: token, html: html });
+        return token;
+      });
+
+      // 2) Inline code (safe on non-code segments)
+      content = content.replace(/\`([^\`]+)\`/g, '<code>$1</code>');
+
+      // 3) Emphasis and strong
+      content = content.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+      content = content.replace(/__(.*?)__/g, '<strong>$1</strong>');
+      content = content.replace(/\*(.*?)\*/g, '<em>$1</em>');
+      content = content.replace(/_(.*?)_/g, '<em>$1</em>');
+
+      // 4) Lists: convert markers to <li> and then group consecutive <li> into a single <ul>
+      content = content.replace(/^\* (.+)$/gm, '<li>$1</li>');
+      content = content.replace(/^- (.+)$/gm, '<li>$1</li>');
+      content = content.replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>');
+      content = content.replace(/(?:\s*<li>.*?<\/li>\s*)+/g, function(m) { return '<ul>' + m + '</ul>'; });
+
+      // 5) Blockquotes
+      content = content.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
+
+      // 6) Replace newlines with <br> ONLY on text outside code/list placeholders
+      // First, temporarily protect list blocks too
+      const listBlocks = [];
+      content = content.replace(/<ul>[\s\S]*?<\/ul>/g, function(m) {
+        const token = '\u0002LB' + listBlocks.length + '\u0002';
+        listBlocks.push({ token: token, html: m });
+        return token;
+      });
+      // Convert remaining newlines (outside code and list blocks)
+      content = content.replace(/\n/g, '<br>');
+      // Restore list blocks
+      listBlocks.forEach(function(item) {
+        content = content.split(item.token).join(item.html);
+      });
+      // Restore code blocks
+      codeBlocks.forEach(function(item) {
+        content = content.split(item.token).join(item.html);
+      });
+
+      // 7) Emojis and symbols
+      content = content.replace(/(✅|❌|⚠️|🚫|📋|🤖|💬|✏️|🗑️|⚙️|🔧|📤|📨)/g, '<span class="emoji">$1</span>');
+
+      return content;
+    }
+    
+    function highlightCode(code, language) {
+      const escaped = escapeHtml(code);
+      // For now, return escaped code without highlighting to avoid regex issues
+      // We can add proper highlighting later
+      return escaped;
+    }
+    
+    function highlightJavaScript(code) {
+      return code;
+    }
+    
+    function highlightTypeScript(code) {
+      return code;
+    }
+    
+    function highlightPython(code) {
+      return code;
+    }
+    
+    function highlightJSON(code) {
+      return code;
+    }
+    
+    function highlightHTML(code) {
+      return code;
+    }
+    
+    function highlightCSS(code) {
+      return code;
+    }
+    
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+    
+  function addCopyButtons(messageDiv) {
+      const codeBlocks = messageDiv.querySelectorAll('.code-block');
+      codeBlocks.forEach(function(block) {
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'copy-btn';
+        copyBtn.textContent = 'Copy';
+        copyBtn.onclick = function() {
+          const codeEl = block.querySelector('code');
+          const code = codeEl ? codeEl.textContent : '';
+          // Normalize newlines and trim leading/trailing blank lines; copy raw code only (no fences)
+          let normalizedCode = code.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+          normalizedCode = normalizedCode.replace(/^\n+/, '').replace(/\n+$/, '');
+          navigator.clipboard.writeText(normalizedCode).then(function() {
+            copyBtn.textContent = 'Copied!';
+            setTimeout(function() {
+              copyBtn.textContent = 'Copy';
+            }, 2000);
+          });
+        };
+        block.appendChild(copyBtn);
+      });
+    }
+    
+    function showSettings() {
+      try {
+        console.log('KP AI: Opening settings');
+        vscode.postMessage({ type: 'openSettings' });
+      } catch (error) {
+        console.error('KP AI: Error in showSettings function:', error);
+      }
+    }
+    
+    function clearChat() {
+      try {
+        console.log('KP AI: Clearing chat');
+        const messages = document.getElementById('messages');
+        if (messages) {
+          messages.innerHTML = '';
+          chatHistory = [];
+          vscode.setState({ chatHistory });
+          console.log('KP AI: Chat cleared successfully');
+        } else {
+          console.error('KP AI: Messages element not found for clearing');
+        }
+      } catch (error) {
+        console.error('KP AI: Error in clearChat function:', error);
+      }
+    }
+
+    function setupEventListeners() {
+      try {
+        console.log('KP AI: Setting up event listeners');
+        
+        // Handle Enter key
+        const input = document.getElementById('input');
+        if (input) {
+          input.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              send();
+            }
+          });
+        } else {
+          console.error('KP AI: Input element not found for event listener');
+        }
+        
+        // Handle send button
+        const sendBtn = document.getElementById('send-btn');
+        if (sendBtn) {
+          sendBtn.addEventListener('click', send);
+        } else {
+          console.error('KP AI: Send button not found');
+        }
+        
+        // Handle mode buttons
+        const askBtn = document.getElementById('ask-btn');
+        const editBtn = document.getElementById('edit-btn');
+        const agentBtn = document.getElementById('agent-btn');
+        
+        if (askBtn) {
+          askBtn.addEventListener('click', function() {
+            selectMode('ask');
+          });
+        } else {
+          console.error('KP AI: Ask button not found');
+        }
+        
+        if (editBtn) {
+          editBtn.addEventListener('click', () => selectMode('edit'));
+        } else {
+          console.error('KP AI: Edit button not found');
+        }
+        
+        if (agentBtn) {
+          agentBtn.addEventListener('click', () => selectMode('agent'));
+        } else {
+          console.error('KP AI: Agent button not found');
+        }
+        
+        // Handle settings button
+        const settingsBtn = document.getElementById('settings-btn');
+        if (settingsBtn) {
+          settingsBtn.addEventListener('click', showSettings);
+        } else {
+          console.error('KP AI: Settings button not found');
+        }
+        
+        // Handle clear button
+        const clearBtn = document.getElementById('clear-btn');
+        if (clearBtn) {
+          clearBtn.addEventListener('click', clearChat);
+        } else {
+          console.error('KP AI: Clear button not found');
+        }
+        
+        console.log('KP AI: Event listeners setup complete');
+      } catch (error) {
+        console.error('KP AI: Error in setupEventListeners function:', error);
+      }
+    }
+    
+    // Initialize when DOM is ready
+    function initialize() {
+      try {
+        console.log('KP AI: Initializing application');
+        restoreHistory();
+        setupEventListeners();
+        // Set initial mode
+        selectMode('ask');
+        // Request initial data
+        vscode.postMessage({ type: 'ready' });
+        console.log('KP AI: Initialization complete');
+      } catch (error) {
+        console.error('KP AI: Error in initialize function:', error);
+      }
+    }
+    
+    // Listen for messages from extension
+    window.addEventListener('message', event => {
+      const message = event.data;
+      if (message.type === 'response') {
+        addMessage('ai', message.content);
+      } else if (message.type === 'clearMessages') {
+        chatHistory = [];
+        vscode.setState({ chatHistory });
+        restoreHistory();
+      } else if (message.type === 'provider') {
+        document.getElementById('provider').textContent = message.name;
+        document.getElementById('provider-select').value = message.id || 'openai';
+      } else if (message.type === 'model') {
+        document.getElementById('model').textContent = message.name;
+        document.getElementById('model-select').value = message.name;
+      } else if (message.type === 'models') {
+        const select = document.getElementById('model-select');
+        select.innerHTML = '';
+        message.models.forEach(model => {
+          const option = document.createElement('option');
+          option.value = model;
+          option.textContent = model;
+          select.appendChild(option);
+        });
+      }
+    });
+    
+    // Initialize when page loads
+    window.onload = initialize;
+    
+    // Also try on DOMContentLoaded for faster initialization
+    document.addEventListener('DOMContentLoaded', function() {
+      console.log('KP AI: DOM Content Loaded');
+      // Check if elements exist
+      const elements = ['ask-btn', 'edit-btn', 'agent-btn', 'settings-btn', 'clear-btn', 'send-btn', 'input', 'messages'];
+      elements.forEach(id => {
+        const element = document.getElementById(id);
+        console.log('KP AI: Element', id, element ? 'found' : 'NOT FOUND');
+      });
+    });
+  </script>
+</body>
+</html>`;
+  }
+
+  private _sendInitialData(webviewView: vscode.WebviewView): void {
+    try {
+      // Send provider info
+      const provider = this.providerManager.getCurrentProvider();
+      const providerData = this.providerManager.getProvider(provider);
+      webviewView.webview.postMessage({
+        type: 'provider',
+        name: providerData?.displayName || provider
+      });
+
+      // Send model info
+      const model = this.providerManager.getCurrentModel();
+      webviewView.webview.postMessage({
+        type: 'model',
+        name: model
+      });
+    } catch (error) {
+      console.error('Error sending initial data:', error);
+    }
+  }
+
+  private async _clearConversation(): Promise<void> {
+    try {
+      await this.chatMode.startNewConversation();
+      this.conversationStarted = false;
+      
+      this._view?.webview.postMessage({
+        type: 'clearMessages'
+      });
+      
+      this._view?.webview.postMessage({
+        type: 'response',
+        content: '🗑️ Conversation history cleared.'
+      });
+    } catch (error) {
+      console.error('Error clearing conversation:', error);
+    }
+  }
+}
